@@ -38,10 +38,13 @@ timestamp_t get_lamport_time()
 
 extern id_size_t last_received_from;
 
-static int handle_message(worker_t * worker)
+static int try_handle_message(worker_t * worker)
 {
 	Message m;
-	while (receive_any(worker, &m));
+	int rc = receive_any(worker, &m);
+	if (rc != 0) {
+		return rc;
+	}
 
 	switch (m.s_header.s_type) {
 		case CS_REQUEST:
@@ -78,6 +81,12 @@ static int handle_message(worker_t * worker)
 			break;
 	}
 
+	return 0;
+}
+
+static int handle_message(worker_t * worker)
+{
+	while (try_handle_message(worker));
 	return 0;
 }
 
@@ -118,6 +127,9 @@ int release_cs(const void * self)
 
 	// Sanity check
 	assert(worker->fork == CleanFork);
+
+	// Check for possible requests
+	try_handle_message(worker);
 
 	// Mark our fork as dirty
 	worker->fork = DirtyFork;
