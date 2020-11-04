@@ -1,7 +1,6 @@
 #pragma once
 
 #include "ipc.h"
-#include "queue.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -12,15 +11,21 @@ typedef struct {
 	int read, write;
 } pipe_pair_t;
 
+typedef enum {
+	AbsentFork,
+	DirtyFork,
+	CleanFork
+} fork_t;
+
 typedef struct {
 	local_id id;
 	id_size_t pipe_matrix_sz;
 	pipe_pair_t ** pipe_matrix;
 	bool mutexcl_enabled;
-	queue_s queue;
 	id_size_t done_counter;
-	id_size_t cs_reply_counter;
 	id_size_t started_counter;
+	fork_t fork;
+	bool * reqs;
 } worker_t;
 
 Message init_message(MessageType type, void * payload, size_t payload_len);

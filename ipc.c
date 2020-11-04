@@ -49,10 +49,17 @@ int receive(void * self, local_id from, Message * msg)
 	return 0;
 }
 
+// Consider this as additional parameter to "receive_any". We cannot change signature
+// directly because it is restricted by assignment
+id_size_t last_received_from = 0;
+
 int receive_any(void * self, Message * msg)
 {
 	worker_t * worker = self;
 	do for (id_size_t i = 0; i < worker->pipe_matrix_sz; ++i) {
-		if (receive(self, i, msg) == 0) { return 0; }
+		if (receive(self, i, msg) == 0) {
+			last_received_from = i;
+			return 0;
+		}
 	} while (!0);
 }

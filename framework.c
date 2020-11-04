@@ -36,6 +36,8 @@ timestamp_t get_lamport_time()
 	return lamport_time;
 }
 
+extern id_size_t last_received_from;
+
 static int handle_message(worker_t * worker)
 {
 	Message m;
@@ -44,27 +46,31 @@ static int handle_message(worker_t * worker)
 	switch (m.s_header.s_type) {
 		case CS_REQUEST:
 		{
-			local_id source = *(local_id *) m.s_payload;
-			q_add(&worker->queue, source, m.s_header.s_local_time);
+			id_size_t source = last_received_from;
 
-			m = init_message(CS_REPLY, NULL, 0);
-			send(worker, source, &m);
+			if (worker->fork == DirtyFork) {
+				worker->fork = AbsentFork;
+
+				m = init_message(CS_RELEASE, NULL, 0);
+				send(worker, source, &m);
+			} else {
+				worker->reqs[source] = true;
+			}
 		}
-			break;
-
-		case CS_REPLY:
-			++(worker->cs_reply_counter);
 			break;
 
 		case CS_RELEASE:
-		{
-			local_id source = *(local_id *) m.s_payload;
-			q_rm(&worker->queue, source);
-		}
+			worker->fork = CleanFork;
 			break;
 
 		case DONE:
+		{
+			// Drop request from that process, if any
+			id_size_t source = last_received_from;
+			worker->reqs[source] = false;
+
 			++(worker->done_counter);
+		}
 			break;
 
 		case STARTED:
@@ -80,24 +86,27 @@ int request_cs(const void * self)
 	// Cast away constness...
 	worker_t * worker = (worker_t *) self;
 
-	// Payload should be empty, but due to controversy between assignment
-	// and receive_any signature it looks reasonable to get sender ID from
-	// request payload
-	Message m = init_message(CS_REQUEST, &worker->id, sizeof(local_id));
+	// If we have a dirty fork, and we have not yet cede it to anyone,
+	// we can go inside CS again
+	if (worker->fork == DirtyFork) {
+		worker->fork = CleanFork;
+	}
+
+	// If we have a clean fork, go straight in. Though, we can only get a
+	// clean fork "for free" if we had a dirty fork before, or if we're
+	// entering the CS recursively
+	if (worker->fork == CleanFork) {
+		return 0;
+	}
+
+	// If we don't have a clean fork, we have to request it
+	Message m = init_message(CS_REQUEST, NULL, 0);
 	send_multicast(worker, &m);
 
-	// Should add self to queue _after_ send, because time is increased in send
-	// and other processes get this new time value
-	q_add(&worker->queue, worker->id, get_lamport_time());
-
-	// Parent also takes part in deciding
-	while (worker->cs_reply_counter != worker->pipe_matrix_sz - 1 /* parent and self */
-			|| q_top(&worker->queue) != worker->id) {
+	while (worker->fork != CleanFork) {
 		int rc = handle_message(worker);
 		if (rc != 0) { return rc; }
 	}
-
-	worker->cs_reply_counter = 0;
 
 	return 0;
 }
@@ -107,13 +116,26 @@ int release_cs(const void * self)
 	// Cast away constness...
 	worker_t * worker = (worker_t *) self;
 
-	q_rm(&worker->queue, worker->id);
+	// Sanity check
+	assert(worker->fork == CleanFork);
 
-	// Payload should be empty, but due to controversy between assignment
-	// and receive_any signature it looks reasonable to get sender ID from
-	// release payload
-	Message m = init_message(CS_RELEASE, &worker->id, sizeof(local_id));
-	return send_multicast(worker, &m);
+	// Mark our fork as dirty
+	worker->fork = DirtyFork;
+
+	// If someone requested fork, pass it
+	for (id_size_t i = 0; i < worker->pipe_matrix_sz; ++i) {
+		id_size_t rq_id = (worker->id + i) % worker->pipe_matrix_sz;
+		if (worker->reqs[rq_id]) {
+			// Clean requests as they will be handled by other processes
+			memset(worker->reqs, 0, sizeof(bool) * worker->pipe_matrix_sz);
+
+			worker->fork = AbsentFork;
+
+			Message m = init_message(CS_RELEASE, NULL, 0);
+			return send(worker, rq_id, &m);
+		}
+	}
+	return 0;
 }
 
 /* static void dump_pipe_matrix(int fd, worker_t * worker)
@@ -203,10 +225,14 @@ static worker_t * alloc_worker(id_size_t pipe_matrix_sz)
 	}
 
 	worker->mutexcl_enabled = false;
-	worker->queue = (queue_s) { 0 };
 	worker->done_counter = 0;
-	worker->cs_reply_counter = 0;
 	worker->started_counter = 0;
+
+	worker->fork = AbsentFork;
+	worker->reqs = (bool *) malloc(sizeof(bool) * pipe_matrix_sz);
+	for (id_size_t i = 0; i < pipe_matrix_sz; ++i) {
+		worker->reqs[i] = false;
+	}
 
 	return worker;
 }
@@ -229,6 +255,7 @@ static void free_worker(worker_t * worker)
 	}
 
 	free(worker->pipe_matrix);
+	free(worker->reqs);
 	free(worker);
 }
 */
@@ -332,6 +359,10 @@ int run_distributed_system(id_size_t workers_count, bool mutexcl)
 			children[i - 1] = child;
 		} else if (child == 0) {
 			worker_template->id = i;
+
+			// First worker has "dirty" fork in the beginning
+			worker_template->fork = (i == 1) ? DirtyFork : AbsentFork;
+
 			close_unused_pipes(worker_template);
 			exit(worker_task(worker_template));
 		} else {
